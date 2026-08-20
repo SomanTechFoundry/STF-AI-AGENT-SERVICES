@@ -58,9 +58,25 @@ export interface AIToolResult {
 // Request / Response
 // ============================================================
 
+/**
+ * Callback the provider calls to execute tools during its internal loop.
+ * Returning results as serialized JSON strings keeps the interface simple
+ * and provider-agnostic.
+ */
+export type ToolExecutor = (
+  calls: AIToolCall[]
+) => Promise<Array<{ toolCallId: string; result: unknown }>>;
+
 export interface AICompletionRequest {
   messages: AIMessage[];
   tools?: AIToolDefinition[];
+  /**
+   * If provided, the provider runs the complete tool-calling loop internally
+   * using a single session. This is required for models that use thought
+   * signatures (e.g. Gemini thinking models), where rebuilding message
+   * history across calls strips the signatures and causes API errors.
+   */
+  toolExecutor?: ToolExecutor;
   maxTokens?: number;
   temperature?: number;
   systemPrompt?: string;

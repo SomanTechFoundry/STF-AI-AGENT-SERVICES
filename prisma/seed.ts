@@ -130,7 +130,7 @@ async function main() {
         "Friendly, professional, and helpful. Speaks naturally and concisely. " +
         "Always confirms details before booking. Warmly greets returning customers.",
       aiProvider: "gemini",
-      aiModel: "gemini-1.5-flash",
+      aiModel: "gemini-3.1-flash-lite",
       humanHandoffEnabled: true,
       humanHandoffPhone: "+12145550100",
       welcomeMessage:

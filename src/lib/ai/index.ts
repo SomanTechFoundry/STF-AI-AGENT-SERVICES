@@ -43,3 +43,38 @@ export function getDefaultProviderName(): SupportedAIProvider {
   }
   return "gemini";
 }
+
+/**
+ * Create the default AI provider from environment configuration.
+ * Throws ConfigurationError if the required API key is missing.
+ */
+export function createDefaultAIProvider(): AIProvider {
+  const { ConfigurationError } = require("@/lib/errors");
+  const providerName = getDefaultProviderName();
+
+  const apiKeyMap: Record<SupportedAIProvider, string | undefined> = {
+    gemini: process.env.GEMINI_API_KEY,
+    openai: process.env.OPENAI_API_KEY,
+    anthropic: process.env.ANTHROPIC_API_KEY,
+  };
+
+  const modelMap: Record<SupportedAIProvider, string> = {
+    gemini: process.env.GEMINI_MODEL ?? "gemini-3.1-flash-lite",
+    openai: process.env.OPENAI_MODEL ?? "gpt-4o-mini",
+    anthropic: process.env.ANTHROPIC_MODEL ?? "claude-3-haiku-20240307",
+  };
+
+  const apiKey = apiKeyMap[providerName];
+  if (!apiKey) {
+    throw new ConfigurationError(
+      `AI provider "${providerName}" is configured but its API key is missing. ` +
+      `Set the corresponding environment variable (e.g. GEMINI_API_KEY).`
+    );
+  }
+
+  return createAIProvider({
+    provider: providerName,
+    model: modelMap[providerName],
+    apiKey,
+  });
+}
