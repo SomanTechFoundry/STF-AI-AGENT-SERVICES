@@ -1,0 +1,625 @@
+// ============================================================
+// STF AI Agent Services — Prisma Schema
+// Multi-tenant schema: every business-owned record carries businessId
+// ============================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ============================================================
+// ENUMS
+// ============================================================
+
+enum BusinessStatus {
+  ACTIVE
+  SUSPENDED
+  TRIAL
+  CANCELLED
+}
+
+enum BusinessIndustry {
+  SALON
+  AUTO_REPAIR
+  CLEANING
+  HVAC_PLUMBING
+  REAL_ESTATE
+  MED_SPA
+  PET_GROOMING
+  LANDSCAPING
+  OTHER
+}
+
+enum UserRole {
+  SUPER_ADMIN  // STF platform admin
+  BUSINESS_OWNER
+  STAFF
+}
+
+enum AppointmentStatus {
+  PENDING
+  CONFIRMED
+  CANCELLED
+  COMPLETED
+  NO_SHOW
+  RESCHEDULED
+}
+
+enum ConversationStatus {
+  ACTIVE
+  RESOLVED
+  ESCALATED
+  ABANDONED
+}
+
+enum ConversationChannel {
+  WEBCHAT
+  SMS
+  VOICE
+  EMAIL
+  WHATSAPP
+}
+
+enum MessageRole {
+  CUSTOMER
+  AGENT
+  SYSTEM
+  HUMAN_AGENT
+}
+
+enum IntegrationType {
+  GOOGLE_CALENDAR
+  SQUARE
+  STRIPE
+  TWILIO
+  RESEND
+  CUSTOM
+}
+
+enum NotificationChannel {
+  SMS
+  EMAIL
+  BOTH
+  NONE
+}
+
+enum DayOfWeek {
+  MONDAY
+  TUESDAY
+  WEDNESDAY
+  THURSDAY
+  FRIDAY
+  SATURDAY
+  SUNDAY
+}
+
+// ============================================================
+// BUSINESS (TENANT)
+// Root entity — every other record traces back here.
+// ============================================================
+
+model Business {
+  id          String          @id @default(cuid())
+  name        String
+  slug        String          @unique   // URL-friendly identifier, e.g. "sunset-salon"
+  industry    BusinessIndustry
+  status      BusinessStatus  @default(TRIAL)
+
+  // Contact information
+  email       String?
+  phone       String?
+  website     String?
+  address     String?
+  city        String?
+  state       String?
+  postalCode  String?
+  country     String          @default("US")
+  timezone    String          @default("America/Chicago")  // IANA timezone
+
+  // Booking settings
+  bookingLeadTimeMinutes  Int   @default(60)   // Minimum notice before appointment
+  bookingMaxDaysAhead     Int   @default(60)   // How far ahead customers can book
+  cancellationPolicyHours Int   @default(24)   // Hours notice required to cancel
+  allowWalkIns            Boolean @default(false)
+
+  // Feature flags per business
+  featuresEnabled Json    @default("{}")   // { "sms": true, "voiceCall": false }
+
+  // Subscription / billing reference
+  stripeCustomerId  String?  @unique
+  stripeSubscriptionId String? @unique
+  trialEndsAt       DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  users            User[]
+  customers        Customer[]
+  staff            Staff[]
+  services         Service[]
+  businessHours    BusinessHours[]
+  appointments     Appointment[]
+  conversations    Conversation[]
+  aiConfiguration  AIConfiguration?
+  knowledgeItems   KnowledgeItem[]
+  integrations     Integration[]
+  usageRecords     UsageRecord[]
+  auditLogs        AuditLog[]
+
+  @@index([slug])
+  @@index([status])
+  @@map("businesses")
+}
+
+// ============================================================
+// USER (Platform / Dashboard User)
+// These are the business owners and staff who log into the admin dashboard.
+// NOT the same as customers.
+// ============================================================
+
+model User {
+  id           String   @id @default(cuid())
+  businessId   String
+  email        String
+  name         String
+  role         UserRole @default(STAFF)
+  passwordHash String?  // null if using OAuth
+  isActive     Boolean  @default(true)
+
+  // Auth
+  emailVerifiedAt DateTime?
+  lastLoginAt     DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@unique([businessId, email])
+  @@index([businessId])
+  @@index([email])
+  @@map("users")
+}
+
+// ============================================================
+// CUSTOMER
+// End-users who interact with the AI agent.
+// ============================================================
+
+model Customer {
+  id           String  @id @default(cuid())
+  businessId   String
+
+  // Identity
+  name         String?
+  phone        String?   // E.164 format, e.g. +12145551234
+  email        String?
+  notes        String?
+
+  // Preferences
+  preferredStaffId  String?
+  preferredChannel  NotificationChannel @default(SMS)
+
+  // Opt-in/out tracking
+  smsOptIn   Boolean @default(false)
+  emailOptIn Boolean @default(false)
+  smsOptInAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  business     Business      @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  appointments Appointment[]
+  conversations Conversation[]
+
+  @@unique([businessId, phone])
+  @@unique([businessId, email])
+  @@index([businessId])
+  @@index([businessId, phone])
+  @@map("customers")
+}
+
+// ============================================================
+// STAFF
+// ============================================================
+
+model Staff {
+  id           String  @id @default(cuid())
+  businessId   String
+  name         String
+  email        String?
+  phone        String?
+  title        String?   // e.g. "Senior Stylist"
+  bio          String?
+  avatarUrl    String?
+  isActive     Boolean @default(true)
+  acceptsBookings Boolean @default(true)
+
+  // Which services this staff member can perform
+  // Many-to-many via StaffService join table
+  services   StaffService[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  business     Business      @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  appointments Appointment[]
+
+  @@unique([businessId, email])
+  @@index([businessId])
+  @@map("staff")
+}
+
+// ============================================================
+// SERVICE
+// What the business offers (e.g. Women's Haircut, Blowout)
+// ============================================================
+
+model Service {
+  id           String  @id @default(cuid())
+  businessId   String
+  name         String
+  description  String?
+  durationMinutes Int        // How long the appointment takes
+  price        Decimal  @db.Decimal(10, 2)
+  currency     String   @default("USD")
+  isActive     Boolean  @default(true)
+
+  // Category for grouping (e.g. "Hair", "Nails", "Waxing")
+  category     String?
+
+  // Buffer time after the appointment (cleanup, etc.)
+  bufferMinutes Int @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  business     Business       @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  staffServices StaffService[]
+  appointments  Appointment[]
+
+  @@index([businessId])
+  @@index([businessId, isActive])
+  @@map("services")
+}
+
+// ============================================================
+// STAFF-SERVICE (Join table)
+// Which staff members can perform which services
+// ============================================================
+
+model StaffService {
+  staffId   String
+  serviceId String
+
+  staff   Staff   @relation(fields: [staffId], references: [id], onDelete: Cascade)
+  service Service @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+
+  @@id([staffId, serviceId])
+  @@map("staff_services")
+}
+
+// ============================================================
+// BUSINESS HOURS
+// Regular weekly schedule per business
+// ============================================================
+
+model BusinessHours {
+  id         String    @id @default(cuid())
+  businessId String
+  dayOfWeek  DayOfWeek
+  isOpen     Boolean   @default(true)
+  openTime   String    // "09:00" in 24h format
+  closeTime  String    // "18:00" in 24h format
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@unique([businessId, dayOfWeek])
+  @@index([businessId])
+  @@map("business_hours")
+}
+
+// ============================================================
+// APPOINTMENT
+// Core booking record
+// ============================================================
+
+model Appointment {
+  id           String            @id @default(cuid())
+  businessId   String
+  customerId   String
+  serviceId    String
+  staffId      String?
+  conversationId String?         // Link to the conversation that created the booking
+
+  status       AppointmentStatus @default(PENDING)
+
+  // Timing
+  startTime    DateTime          // UTC
+  endTime      DateTime          // UTC (calculated from service duration)
+  timezone     String            // Customer's timezone at time of booking
+
+  // Pricing at time of booking (captured for historical accuracy)
+  price        Decimal           @db.Decimal(10, 2)
+  currency     String            @default("USD")
+
+  // External calendar sync
+  googleCalendarEventId  String?  @unique
+
+  // Idempotency key to prevent duplicate bookings from retries
+  idempotencyKey String?          @unique
+
+  // Reminder tracking
+  reminderSentAt  DateTime?
+  confirmationSentAt DateTime?
+
+  notes        String?
+  cancellationReason String?
+  cancelledAt  DateTime?
+
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  business   Business    @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  customer   Customer    @relation(fields: [customerId], references: [id])
+  service    Service     @relation(fields: [serviceId], references: [id])
+  staff      Staff?      @relation(fields: [staffId], references: [id])
+
+  @@index([businessId])
+  @@index([businessId, status])
+  @@index([businessId, startTime])
+  @@index([customerId])
+  @@index([staffId, startTime])
+  @@map("appointments")
+}
+
+// ============================================================
+// CONVERSATION
+// Tracks a customer interaction session (chat, SMS thread, etc.)
+// ============================================================
+
+model Conversation {
+  id           String              @id @default(cuid())
+  businessId   String
+  customerId   String?             // May be null until customer is identified
+
+  channel      ConversationChannel @default(WEBCHAT)
+  status       ConversationStatus  @default(ACTIVE)
+
+  // For SMS: the phone number the conversation is with
+  channelIdentifier String?        // e.g. phone number, chat session token
+
+  // Structured state the agent maintains during the conversation
+  // Contains fields like: { customerName, service, requestedDate, bookingStatus }
+  agentState   Json                @default("{}")
+
+  // Summary generated when conversation ends (for future reference)
+  summary      String?
+
+  escalatedAt  DateTime?
+  resolvedAt   DateTime?
+
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  business  Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  customer  Customer? @relation(fields: [customerId], references: [id])
+  messages  Message[]
+
+  @@index([businessId])
+  @@index([businessId, status])
+  @@index([businessId, channelIdentifier])
+  @@map("conversations")
+}
+
+// ============================================================
+// MESSAGE
+// Individual turns within a conversation
+// ============================================================
+
+model Message {
+  id             String      @id @default(cuid())
+  conversationId String
+  role           MessageRole
+  content        String      @db.Text
+
+  // AI metadata (for usage tracking and debugging)
+  aiProvider     String?     // e.g. "gemini", "openai"
+  aiModel        String?     // e.g. "gemini-1.5-flash"
+  inputTokens    Int?
+  outputTokens   Int?
+  toolCalls      Json?       // Array of tool calls made in this turn
+  toolResults    Json?       // Array of tool results
+
+  // Latency
+  durationMs     Int?
+
+  createdAt DateTime @default(now())
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@index([conversationId])
+  @@index([conversationId, createdAt])
+  @@map("messages")
+}
+
+// ============================================================
+// AI CONFIGURATION
+// Per-business AI agent settings
+// ============================================================
+
+model AIConfiguration {
+  id           String  @id @default(cuid())
+  businessId   String  @unique
+
+  // Agent identity
+  agentName    String  @default("AI Receptionist")
+  agentPersonality String? @db.Text  // Personality description for system prompt
+  systemPromptOverride String? @db.Text  // Override the default system prompt
+
+  // Provider preference
+  aiProvider   String  @default("gemini")
+  aiModel      String  @default("gemini-1.5-flash")
+
+  // Behavior settings
+  maxConversationTurns  Int @default(20)
+  humanHandoffEnabled   Boolean @default(true)
+  humanHandoffPhone     String?   // Phone/contact for human escalation
+  humanHandoffEmail     String?
+
+  // Greeting message sent at conversation start
+  welcomeMessage String? @db.Text
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@map("ai_configurations")
+}
+
+// ============================================================
+// KNOWLEDGE ITEM
+// FAQs, policies, and business-specific information for the AI
+// ============================================================
+
+model KnowledgeItem {
+  id           String  @id @default(cuid())
+  businessId   String
+
+  // Used to categorize (e.g. "faq", "policy", "service_info")
+  category     String  @default("faq")
+
+  question     String  @db.Text
+  answer       String  @db.Text
+
+  isActive     Boolean @default(true)
+
+  // Priority for ordering when injected into context (lower = higher priority)
+  priority     Int     @default(100)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@index([businessId])
+  @@index([businessId, category])
+  @@index([businessId, isActive])
+  @@map("knowledge_items")
+}
+
+// ============================================================
+// INTEGRATION
+// External service credentials and configuration per business
+// Credentials are stored encrypted at rest in production
+// ============================================================
+
+model Integration {
+  id           String          @id @default(cuid())
+  businessId   String
+  type         IntegrationType
+  isEnabled    Boolean         @default(false)
+
+  // Encrypted configuration blob (connection details, tokens, etc.)
+  // Decrypted only when needed by the integration handler
+  configJson   Json            @default("{}")
+
+  lastSyncedAt DateTime?
+  lastErrorAt  DateTime?
+  lastError    String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@unique([businessId, type])
+  @@index([businessId])
+  @@map("integrations")
+}
+
+// ============================================================
+// USAGE RECORD
+// Tracks API/AI usage per business for cost allocation
+// ============================================================
+
+model UsageRecord {
+  id           String  @id @default(cuid())
+  businessId   String
+
+  // What kind of usage
+  usageType    String  // "ai_request", "sms", "voice_minute", "email", "calendar_api"
+
+  // Quantity
+  quantity     Int     @default(1)
+
+  // AI-specific
+  aiProvider   String?
+  aiModel      String?
+  inputTokens  Int?
+  outputTokens Int?
+
+  // Twilio-specific
+  twilioSid    String?
+
+  // Reference to the conversation or appointment
+  conversationId  String?
+  appointmentId   String?
+
+  // Cost in USD cents (estimated at time of recording)
+  estimatedCostCents Int?
+
+  recordedAt DateTime @default(now())
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@index([businessId])
+  @@index([businessId, usageType])
+  @@index([businessId, recordedAt])
+  @@map("usage_records")
+}
+
+// ============================================================
+// AUDIT LOG
+// Immutable record of significant actions for security/compliance
+// ============================================================
+
+model AuditLog {
+  id           String  @id @default(cuid())
+  businessId   String
+
+  // Who/what performed the action
+  actorType    String  // "user", "agent", "system", "api"
+  actorId      String? // userId or "agent"
+
+  // What happened
+  action       String  // e.g. "appointment.created", "customer.updated"
+  resourceType String? // e.g. "appointment"
+  resourceId   String? // e.g. appointmentId
+
+  // Safe snapshot of the change (no secrets)
+  metadata     Json    @default("{}")
+
+  // Request context
+  requestId    String?
+  ipAddress    String?
+  userAgent    String?
+
+  createdAt DateTime @default(now())
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@index([businessId])
+  @@index([businessId, action])
+  @@index([businessId, createdAt])
+  @@index([resourceType, resourceId])
+  @@map("audit_logs")
+}
