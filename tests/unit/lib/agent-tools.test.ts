@@ -49,6 +49,13 @@ jest.mock("@/lib/services/business-hours.service", () => ({
   },
 }));
 
+jest.mock("@/lib/services/appointment.service", () => ({
+  appointmentService: {
+    checkAvailability: jest.fn(),
+    createAppointment: jest.fn(),
+  },
+}));
+
 const mockContext = {
   businessId: "biz-test-123",
   conversationId: "conv-test-456",
@@ -113,20 +120,27 @@ describe("SALON_TOOLS registry", () => {
 
 describe("checkAvailabilityTool", () => {
   const { serviceService } = require("@/lib/services/service.service");
+  const { appointmentService } = require("@/lib/services/appointment.service");
+
+  const mockSvc = { id: "svc-1", name: "Women's Haircut", durationMinutes: 60, price: 65, currency: "USD" };
 
   beforeEach(() => {
-    serviceService.findByName.mockResolvedValue({
-      id: "svc-1",
-      name: "Women's Haircut",
-      durationMinutes: 60,
-      price: 65,
-      currency: "USD",
+    serviceService.findByName.mockResolvedValue(mockSvc);
+    appointmentService.checkAvailability.mockResolvedValue({
+      isOpen: true,
+      date: "2025-06-15",
+      timezone: "America/Chicago",
+      service: mockSvc,
+      slots: [
+        { time: "09:00", staffId: "staff-1", staffName: "Maria" },
+        { time: "10:00", staffId: "staff-1", staffName: "Maria" },
+      ],
     });
   });
 
   it("returns available slots for valid input", async () => {
     const result = await checkAvailabilityTool.execute(
-      { serviceName: "Women's Haircut", date: "2024-06-15" },
+      { serviceName: "Women's Haircut", date: "2025-06-15" },
       mockContext
     );
     expect(result.success).toBe(true);
