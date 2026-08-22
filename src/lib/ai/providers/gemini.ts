@@ -6,9 +6,19 @@
  * separate API calls, the thought_signature is stripped and the API returns
  * a 400 error on the next tool-calling turn.
  *
- * Fix: When a toolExecutor is provided, run the ENTIRE tool-calling loop
- * inside a single ChatSession. The SDK preserves thought_signatures
- * automatically within a session's history.
+ * Fix: Run the ENTIRE tool-calling loop inside a single ChatSession so the
+ * SDK preserves thought_signatures automatically in its internal history.
+ *
+ * Streaming note: sendMessageStream() cannot be used for tool-call turns
+ * because the streaming endpoint does not return thought_signatures in the
+ * per-chunk payloads. When the chat history is updated from stream chunks
+ * the thought_signature is lost, causing subsequent calls to fail with:
+ * "Please ensure that function response turn comes immediately after a
+ * function call turn."
+ *
+ * Instead, stream() uses sendMessage() (non-streaming) for ALL turns and
+ * delivers the final text to onChunk as a single payload. The client
+ * animates it locally with a typewriter effect for smooth UX.
  */
 
 import {
@@ -19,6 +29,7 @@ import {
   type Tool,
   type FunctionDeclaration,
   type Part,
+  type FunctionCall,
 } from "@google/generative-ai";
 
 import type {
@@ -35,9 +46,13 @@ import { logger } from "@/lib/logger";
 
 const MAX_INTERNAL_ITERATIONS = 6;
 
+type ChatSession = ReturnType<
+  ReturnType<GoogleGenerativeAI["getGenerativeModel"]>["startChat"]
+>;
+
 const SAFETY_SETTINGS = [
-  { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
-  { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
+  { category: HarmCategory.HARM_CATEGORY_HARASSMENT,        threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
+  { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH,       threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
   { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
   { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
 ];
@@ -52,96 +67,67 @@ export class GeminiProvider implements AIProvider {
     this.modelName = model;
   }
 
+  // ============================================================
+  // complete() — non-streaming, full response returned at once
+  // ============================================================
+
   async complete(request: AICompletionRequest): Promise<AICompletionResponse> {
     const startMs = Date.now();
-
     try {
-      const tools = request.tools ? this.buildTools(request.tools) : undefined;
+      const { chat, currentParts } = this.startSession(request);
 
-      const model = this.client.getGenerativeModel({
-        model: this.modelName,
-        systemInstruction: request.systemPrompt,
-        tools,
-        safetySettings: SAFETY_SETTINGS,
-        generationConfig: {
-          maxOutputTokens: request.maxTokens ?? 1024,
-          temperature: request.temperature ?? 0.7,
-        },
-      });
-
-      // Split messages: all but last form the history; last is the new turn
-      const allMessages = request.messages.filter((m) => m.role !== "system");
-      const history = allMessages.slice(0, -1);
-      const lastMessage = allMessages[allMessages.length - 1];
-
-      if (!lastMessage) {
-        throw new AppError(ErrorCode.AI_PROVIDER_ERROR, "No messages provided", 400);
+      if (request.toolExecutor && request.tools?.length) {
+        return await this.runToolLoop(chat, currentParts, request.toolExecutor, undefined, startMs);
       }
 
-      const geminiHistory = history.map((m) => this.toGeminiContent(m));
-      const chat = model.startChat({ history: geminiHistory });
-      const currentParts = this.buildCurrentParts(lastMessage);
+      const result = await chat.sendMessage(currentParts);
+      return this.buildSingleTurnResponse(result.response, startMs);
+    } catch (err) {
+      this.handleError(err);
+    }
+  }
 
-      // ---- If toolExecutor provided: run full loop inside one session ----
+  // ============================================================
+  // stream() — delivers final text via onChunk, tools run sync
+  //
+  // Uses sendMessage() internally (same as complete()) to avoid
+  // the thought_signature issue with sendMessageStream(). The
+  // client receives the full text as a single onChunk call and
+  // renders it with a local typewriter animation.
+  // ============================================================
+
+  async stream(request: AICompletionRequest): Promise<AICompletionResponse> {
+    if (!request.onChunk) {
+      return this.complete(request);
+    }
+
+    const startMs = Date.now();
+    try {
+      const { chat, currentParts } = this.startSession(request);
+
       if (request.toolExecutor && request.tools?.length) {
         return await this.runToolLoop(
           chat,
           currentParts,
           request.toolExecutor,
+          request.onChunk,
           startMs
         );
       }
 
-      // ---- Single-turn: just one call, no tool execution ----
+      // Single-turn: no tools — just complete and deliver via onChunk
       const result = await chat.sendMessage(currentParts);
-      const response = result.response;
-      const usage = response.usageMetadata;
-      const durationMs = Date.now() - startMs;
-
-      const functionCalls = response.functionCalls();
-      if (functionCalls?.length) {
-        const toolCalls: AIToolCall[] = functionCalls.map((fc, i) => ({
-          id: `${fc.name}-${i}-${Date.now()}`,
-          name: fc.name,
-          arguments: fc.args as Record<string, unknown>,
-        }));
-
-        return {
-          message: { role: "assistant", content: "", toolCalls },
-          toolCalls,
-          usage: {
-            inputTokens: usage?.promptTokenCount ?? 0,
-            outputTokens: usage?.candidatesTokenCount ?? 0,
-          },
-          stopReason: "tool_calls",
-          provider: this.providerName,
-          model: this.modelName,
-          durationMs,
-        };
-      }
-
-      return {
-        message: { role: "assistant", content: response.text() },
-        usage: {
-          inputTokens: usage?.promptTokenCount ?? 0,
-          outputTokens: usage?.candidatesTokenCount ?? 0,
-        },
-        stopReason: "stop",
-        provider: this.providerName,
-        model: this.modelName,
-        durationMs,
-      };
+      const text = this.safeText(result.response);
+      if (text) request.onChunk(text);
+      return this.buildSingleTurnResponse(result.response, startMs);
     } catch (err) {
-      if (err instanceof AppError) throw err;
-      logger.error("Gemini API error", err);
-      throw new AppError(
-        ErrorCode.AI_PROVIDER_ERROR,
-        "The AI service is temporarily unavailable. Please try again.",
-        502,
-        { cause: err instanceof Error ? err : undefined }
-      );
+      this.handleError(err);
     }
   }
+
+  // ============================================================
+  // healthCheck
+  // ============================================================
 
   async healthCheck(): Promise<boolean> {
     try {
@@ -154,14 +140,15 @@ export class GeminiProvider implements AIProvider {
   }
 
   // ============================================================
-  // Internal tool loop — runs entirely within one ChatSession
-  // so thought_signatures are preserved automatically by the SDK
+  // Internal tool loop — always uses sendMessage() for all turns
+  // so thought_signatures are preserved in the ChatSession history.
   // ============================================================
 
   private async runToolLoop(
-    chat: ReturnType<ReturnType<GoogleGenerativeAI["getGenerativeModel"]>["startChat"]>,
+    chat: ChatSession,
     initialParts: Part[],
     toolExecutor: ToolExecutor,
+    onChunk: ((text: string) => void) | undefined,
     startMs: number
   ): Promise<AICompletionResponse> {
     let parts: Part[] = initialParts;
@@ -176,12 +163,16 @@ export class GeminiProvider implements AIProvider {
       totalInputTokens += usage?.promptTokenCount ?? 0;
       totalOutputTokens += usage?.candidatesTokenCount ?? 0;
 
-      const functionCalls = response.functionCalls();
+      const functionCalls = this.safeFunctionCalls(response);
 
-      // No more tool calls — this is the final text response
-      if (!functionCalls || functionCalls.length === 0) {
+      // No function calls → final text response
+      if (functionCalls.length === 0) {
+        const fullText = this.safeText(response);
+        // Deliver to onChunk as a single payload; the client renders a
+        // local typewriter animation so the UX still feels progressive.
+        onChunk?.(fullText);
         return {
-          message: { role: "assistant", content: response.text() },
+          message: { role: "assistant", content: fullText },
           toolCalls: allToolCalls.length ? allToolCalls : undefined,
           usage: { inputTokens: totalInputTokens, outputTokens: totalOutputTokens },
           stopReason: "stop",
@@ -191,7 +182,7 @@ export class GeminiProvider implements AIProvider {
         };
       }
 
-      // Map Gemini function calls to our typed AIToolCall format
+      // Map Gemini function calls → typed AIToolCall
       const typedCalls: AIToolCall[] = functionCalls.map((fc, idx) => ({
         id: `${fc.name}-${i}-${idx}-${Date.now()}`,
         name: fc.name,
@@ -199,13 +190,10 @@ export class GeminiProvider implements AIProvider {
       }));
       allToolCalls.push(...typedCalls);
 
-      // Execute tools via the provided callback
+      // Execute tools via callback — stays in the same ChatSession
       const toolResults = await toolExecutor(typedCalls);
 
-      // Build function response parts to send back in the SAME session
-      // The SDK retains thought_signatures in its internal history
       parts = toolResults.map((tr) => {
-        // Find the original call to get the Gemini function name
         const call = typedCalls.find((c) => c.id === tr.toolCallId) ?? typedCalls[0];
         return {
           functionResponse: {
@@ -216,12 +204,11 @@ export class GeminiProvider implements AIProvider {
       });
     }
 
-    // Fallback if we somehow exhausted iterations
+    // Exhausted iterations fallback
+    const fallbackText = "I've gathered the information needed. How else can I help you?";
+    onChunk?.(fallbackText);
     return {
-      message: {
-        role: "assistant",
-        content: "I've gathered the information needed. How else can I help you?",
-      },
+      message: { role: "assistant", content: fallbackText },
       toolCalls: allToolCalls.length ? allToolCalls : undefined,
       usage: { inputTokens: totalInputTokens, outputTokens: totalOutputTokens },
       stopReason: "max_tokens",
@@ -234,6 +221,111 @@ export class GeminiProvider implements AIProvider {
   // ============================================================
   // Private helpers
   // ============================================================
+
+  private startSession(request: AICompletionRequest): {
+    chat: ChatSession;
+    currentParts: Part[];
+  } {
+    const tools = request.tools ? this.buildTools(request.tools) : undefined;
+
+    const model = this.client.getGenerativeModel({
+      model: this.modelName,
+      systemInstruction: request.systemPrompt,
+      tools,
+      safetySettings: SAFETY_SETTINGS,
+      generationConfig: {
+        maxOutputTokens: request.maxTokens ?? 1024,
+        temperature: request.temperature ?? 0.7,
+      },
+    });
+
+    const allMessages = request.messages.filter((m) => m.role !== "system");
+    const history = allMessages.slice(0, -1);
+    const lastMessage = allMessages[allMessages.length - 1];
+
+    if (!lastMessage) {
+      throw new AppError(ErrorCode.AI_PROVIDER_ERROR, "No messages provided", 400);
+    }
+
+    const chat = model.startChat({
+      history: history.map((m) => this.toGeminiContent(m)),
+    });
+    const currentParts = this.buildCurrentParts(lastMessage);
+    return { chat, currentParts };
+  }
+
+  private buildSingleTurnResponse(
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    response: any,
+    startMs: number
+  ): AICompletionResponse {
+    const usage = response.usageMetadata;
+    const durationMs = Date.now() - startMs;
+    const functionCalls = this.safeFunctionCalls(response);
+
+    if (functionCalls.length) {
+      const toolCalls: AIToolCall[] = functionCalls.map(
+        (fc: FunctionCall, i: number) => ({
+          id: `${fc.name}-${i}-${Date.now()}`,
+          name: fc.name,
+          arguments: fc.args as Record<string, unknown>,
+        })
+      );
+      return {
+        message: { role: "assistant", content: "", toolCalls },
+        toolCalls,
+        usage: {
+          inputTokens: usage?.promptTokenCount ?? 0,
+          outputTokens: usage?.candidatesTokenCount ?? 0,
+        },
+        stopReason: "tool_calls",
+        provider: this.providerName,
+        model: this.modelName,
+        durationMs,
+      };
+    }
+
+    return {
+      message: { role: "assistant", content: this.safeText(response) },
+      usage: {
+        inputTokens: usage?.promptTokenCount ?? 0,
+        outputTokens: usage?.candidatesTokenCount ?? 0,
+      },
+      stopReason: "stop",
+      provider: this.providerName,
+      model: this.modelName,
+      durationMs,
+    };
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private safeText(response: any): string {
+    try {
+      return response.text() ?? "";
+    } catch {
+      return "";
+    }
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private safeFunctionCalls(response: any): FunctionCall[] {
+    try {
+      return response.functionCalls() ?? [];
+    } catch {
+      return [];
+    }
+  }
+
+  private handleError(err: unknown): never {
+    if (err instanceof AppError) throw err;
+    logger.error("Gemini API error", err);
+    throw new AppError(
+      ErrorCode.AI_PROVIDER_ERROR,
+      "The AI service is temporarily unavailable. Please try again.",
+      502,
+      { cause: err instanceof Error ? err : undefined }
+    );
+  }
 
   private toGeminiContent(message: AIMessage): Content {
     if (message.role === "assistant") {

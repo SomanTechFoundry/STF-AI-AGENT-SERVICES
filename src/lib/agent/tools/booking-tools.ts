@@ -11,9 +11,43 @@ import { conversationService } from "@/lib/services/conversation.service";
 import { serviceService } from "@/lib/services/service.service";
 import { staffService } from "@/lib/services/staff.service";
 import { appointmentService } from "@/lib/services/appointment.service";
+import { notificationService } from "@/lib/services/notification.service";
+import { businessService } from "@/lib/services/business.service";
+import { resolveRelativeDate } from "@/lib/utils/date-time";
 import { logger } from "@/lib/logger";
 import type { AgentTool, ToolContext } from "./types";
 import { toolSuccess, toolError } from "./types";
+
+// ============================================================
+// Shared helper — resolve a date that may still be a relative
+// phrase ("today", "next friday") if the AI didn't convert it.
+// The system prompt instructs the AI to always pass ISO dates,
+// but this is a safety net so booking never hard-fails on it.
+// ============================================================
+
+async function resolveDateOrError(
+  businessId: string,
+  rawDate: string
+): Promise<{ date: string } | { error: string }> {
+  if (/^\d{4}-\d{2}-\d{2}$/.test(rawDate)) return { date: rawDate };
+
+  try {
+    const business = await businessService.getById(businessId);
+    const resolved = resolveRelativeDate(rawDate, business.timezone);
+
+    if (!resolved) {
+      return {
+        error: `I couldn't understand the date "${rawDate}". Could you give me a specific day, like "tomorrow" or a date such as August 25?`,
+      };
+    }
+    return { date: resolved };
+  } catch (err) {
+    logger.error("resolveDateOrError failed", err, { businessId, rawDate });
+    return {
+      error: `I couldn't understand the date "${rawDate}". Could you give me a specific day, like "tomorrow" or a date such as August 25?`,
+    };
+  }
+}
 
 // ============================================================
 // checkAvailability
@@ -21,7 +55,7 @@ import { toolSuccess, toolError } from "./types";
 
 const checkAvailabilitySchema = z.object({
   serviceName: z.string().min(1),
-  date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Date must be YYYY-MM-DD"),
+  date: z.string().min(1, "Date is required"),
   staffName: z.string().optional(),
 });
 
@@ -41,7 +75,10 @@ export const checkAvailabilityTool: AgentTool = {
         },
         date: {
           type: "string",
-          description: "The requested date in YYYY-MM-DD format",
+          description:
+            "The requested date in YYYY-MM-DD format. Always resolve relative terms " +
+            "like 'today', 'tomorrow', or 'next Friday' to an ISO date using the date " +
+            "reference table in your system prompt before calling this tool.",
         },
         staffName: {
           type: "string",
@@ -56,11 +93,15 @@ export const checkAvailabilityTool: AgentTool = {
     const parsed = checkAvailabilitySchema.safeParse(args ?? {});
     if (!parsed.success) {
       return toolError(
-        "To check availability I need the service name and a date (e.g. 2025-01-15)."
+        "To check availability I need the service name and a date (e.g. \"tomorrow\" or 2025-01-15)."
       );
     }
 
-    const { serviceName, date, staffName } = parsed.data;
+    const { serviceName, date: rawDate, staffName } = parsed.data;
+
+    const dateResult = await resolveDateOrError(context.businessId, rawDate);
+    if ("error" in dateResult) return toolError(dateResult.error);
+    const date = dateResult.date;
 
     try {
       // Resolve service
@@ -153,7 +194,7 @@ export const checkAvailabilityTool: AgentTool = {
 
 const createAppointmentSchema = z.object({
   serviceName: z.string().min(1),
-  date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  date: z.string().min(1, "Date is required"),
   time: z.string().regex(/^\d{2}:\d{2}$/, "Time must be HH:MM in 24-hour format"),
   customerId: z.string().min(1),
   staffName: z.string().optional(),
@@ -177,7 +218,10 @@ export const createAppointmentTool: AgentTool = {
         },
         date: {
           type: "string",
-          description: "Date in YYYY-MM-DD format (in business local time)",
+          description:
+            "Date in YYYY-MM-DD format (in business local time). Always resolve relative " +
+            "terms like 'today' or 'tomorrow' to an ISO date first, using the date reference " +
+            "table in your system prompt.",
         },
         time: {
           type: "string",
@@ -209,7 +253,11 @@ export const createAppointmentTool: AgentTool = {
       );
     }
 
-    const { serviceName, date, time, customerId, staffName, notes } = parsed.data;
+    const { serviceName, date: rawDate, time, customerId, staffName, notes } = parsed.data;
+
+    const dateResult = await resolveDateOrError(context.businessId, rawDate);
+    if ("error" in dateResult) return toolError(dateResult.error);
+    const date = dateResult.date;
 
     try {
       // Resolve service
@@ -266,6 +314,13 @@ export const createAppointmentTool: AgentTool = {
         time,
         customerId,
       });
+
+      // Fire-and-forget: send SMS + email confirmation.
+      // Never awaited so a notification failure never blocks the booking response.
+      void notificationService.sendAppointmentConfirmation(
+        appointment.id,
+        context.businessId
+      );
 
       return toolSuccess({
         appointmentId: appointment.id,

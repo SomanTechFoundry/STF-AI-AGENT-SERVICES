@@ -86,6 +86,10 @@ export class CustomerService {
 
   /**
    * Find or create a customer — used by the agent to identify callers.
+   * If an existing customer is found and the new input grants SMS opt-in
+   * (or updates email opt-in / missing contact fields), those fields are
+   * refreshed so a returning customer who provides a phone mid-chat still
+   * receives SMS confirmations.
    */
   async findOrCreate(
     businessId: string,
@@ -96,7 +100,27 @@ export class CustomerService {
       email: input.email,
     });
 
-    if (existing) return { customer: existing, created: false };
+    if (existing) {
+      const needsUpdate =
+        (input.smsOptIn === true && !existing.smsOptIn) ||
+        (input.emailOptIn === true && !existing.emailOptIn) ||
+        (input.name && !existing.name) ||
+        (input.phone && !existing.phone) ||
+        (input.email && !existing.email);
+
+      if (needsUpdate) {
+        const updated = await this.update(businessId, existing.id, {
+          ...(input.smsOptIn === true && { smsOptIn: true }),
+          ...(input.emailOptIn === true && { emailOptIn: true }),
+          ...(input.name && !existing.name && { name: input.name }),
+          ...(input.phone && !existing.phone && { phone: input.phone }),
+          ...(input.email && !existing.email && { email: input.email }),
+        });
+        return { customer: updated, created: false };
+      }
+
+      return { customer: existing, created: false };
+    }
 
     const customer = await this.create(businessId, input);
     return { customer, created: true };

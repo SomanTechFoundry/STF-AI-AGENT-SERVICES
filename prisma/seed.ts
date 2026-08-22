@@ -127,16 +127,16 @@ async function main() {
       businessId: business.id,
       agentName: "Sunny",
       agentPersonality:
-        "Friendly, professional, and helpful. Speaks naturally and concisely. " +
-        "Always confirms details before booking. Warmly greets returning customers.",
+        "Warm, confident, and professional — like an experienced salon receptionist who knows the business " +
+        "inside and out. Speaks naturally and concisely. Gets to the point without filler phrases. " +
+        "One question at a time. Confirms details before booking. Makes customers feel welcome and taken care of.",
       aiProvider: "gemini",
       aiModel: "gemini-3.1-flash-lite",
       humanHandoffEnabled: true,
       humanHandoffPhone: "+12145550100",
       welcomeMessage:
-        "Hi! I'm Sunny, the AI receptionist at Sunset Salon. " +
-        "I can help you book an appointment, answer questions about our services, " +
-        "or check your upcoming appointments. How can I help you today?",
+        "Hi there! I'm Sunny at Sunset Salon. I can help you book an appointment, " +
+        "check our services and pricing, or answer any questions. What can I do for you today?",
     },
   });
 

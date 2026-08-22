@@ -25,6 +25,8 @@
     "next": "^16.3.1",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
+    "resend": "^6.21.0",
+    "twilio": "^6.1.0",
     "zod": "^3.24.2"
   },
   "devDependencies": {

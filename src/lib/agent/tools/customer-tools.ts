@@ -19,7 +19,9 @@ const findOrCreateSchema = z.object({
   name: z.string().min(1).optional(),
   phone: z.string().optional(),
   email: z.string().email().optional(),
-  smsOptIn: z.boolean().optional().default(false),
+  // Do NOT default to false here — Zod .default(false) made smsOptIn always
+  // defined, which blocked the "opt in when phone is provided" fallback.
+  smsOptIn: z.boolean().optional(),
 });
 
 export const findOrCreateCustomerTool: AgentTool = {
@@ -28,7 +30,8 @@ export const findOrCreateCustomerTool: AgentTool = {
     description:
       "Find an existing customer by phone or email, or create a new one if they don't exist. " +
       "Call this once you have collected the customer's phone number or email address. " +
-      "At least one of phone or email is required. Name is helpful but optional.",
+      "At least one of phone or email is required. Name is helpful but optional. " +
+      "When a phone number is provided, SMS confirmation opt-in is automatic — do not pass smsOptIn unless the customer explicitly declines SMS.",
     parameters: {
       type: "object",
       properties: {
@@ -46,7 +49,9 @@ export const findOrCreateCustomerTool: AgentTool = {
         },
         smsOptIn: {
           type: "boolean",
-          description: "Whether the customer consents to SMS reminders",
+          description:
+            "Only set this to false if the customer explicitly declines SMS confirmations. " +
+            "Otherwise omit it — providing a phone number opts them in automatically.",
         },
       },
       required: [],
@@ -79,14 +84,18 @@ export const findOrCreateCustomerTool: AgentTool = {
     }
 
     try {
+      // Providing a phone in chat = consent for booking SMS confirmations.
+      // Only an explicit smsOptIn:false from the AI overrides that.
+      const resolvedSmsOptIn = smsOptIn === false ? false : !!phone;
+
       const { customer, created } = await customerService.findOrCreate(
         context.businessId,
         {
           name: name ?? null,
           phone: phone ?? null,
           email: email ?? null,
-          smsOptIn: smsOptIn ?? false,
-          emailOptIn: false,
+          smsOptIn: resolvedSmsOptIn,
+          emailOptIn: !!email,
           preferredChannel: "SMS",
         }
       );

@@ -77,6 +77,12 @@ export interface AICompletionRequest {
    * history across calls strips the signatures and causes API errors.
    */
   toolExecutor?: ToolExecutor;
+  /**
+   * If provided, the provider calls this with each text token as it is
+   * generated on the final (non-tool-call) turn. Tool-call turns are
+   * always synchronous; streaming applies only to the final text response.
+   */
+  onChunk?: (text: string) => void;
   maxTokens?: number;
   temperature?: number;
   systemPrompt?: string;
@@ -103,7 +109,20 @@ export interface AIProvider {
   readonly providerName: string;
   readonly modelName: string;
 
+  /**
+   * Non-streaming completion. Runs the full tool-calling loop and returns
+   * the complete response once all turns are finished.
+   */
   complete(request: AICompletionRequest): Promise<AICompletionResponse>;
+
+  /**
+   * Streaming completion. Runs tool-calling turns synchronously (no stream),
+   * then streams the final text response by calling request.onChunk for each
+   * token. Returns the full AICompletionResponse once the stream is exhausted.
+   *
+   * Falls back to complete() if onChunk is not provided.
+   */
+  stream(request: AICompletionRequest): Promise<AICompletionResponse>;
 
   /**
    * Check if the provider is configured and reachable.

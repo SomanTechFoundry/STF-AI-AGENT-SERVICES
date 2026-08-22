@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useRef, useEffect, useCallback } from "react";
+import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 
 // ============================================================
 // Types
@@ -12,6 +12,7 @@ interface Message {
   content: string;
   timestamp: Date;
   isError?: boolean;
+  isStreaming?: boolean;
 }
 
 interface Props {
@@ -33,6 +34,93 @@ function generateId() {
 
 function formatTime(date: Date): string {
   return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+/**
+ * Read a ReadableStream body as NDJSON.
+ * Each line is one JSON object; blank lines are skipped.
+ */
+async function* readNDJSON(
+  body: ReadableStream<Uint8Array>
+): AsyncGenerator<Record<string, unknown>> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        try {
+          yield JSON.parse(trimmed) as Record<string, unknown>;
+        } catch {
+          // malformed line — skip
+        }
+      }
+    }
+    // Flush remaining buffer
+    if (buffer.trim()) {
+      try {
+        yield JSON.parse(buffer.trim()) as Record<string, unknown>;
+      } catch {
+        /* ignore */
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+/**
+ * Typewriter animation speed (characters per second).
+ * 80 chars/s ≈ fast typing feel; at 500 chars response ≈ 6s to type out.
+ * We use word-level chunks (not char-by-char) for performance.
+ */
+const TYPEWRITER_CHARS_PER_SEC = 300;
+
+/**
+ * Animate text appearing word-by-word in a message bubble.
+ * Returns a cancel function.
+ */
+function animateTypewriter(
+  fullText: string,
+  onProgress: (partial: string) => void,
+  onDone: () => void
+): () => void {
+  // Split at word boundaries, keeping whitespace attached to words
+  const tokens = fullText.match(/\S+\s*/g) ?? [fullText];
+  let i = 0;
+  let cancelled = false;
+
+  // Calculate per-token delay so total time ≈ fullText.length / CHARS_PER_SEC
+  const totalChars = fullText.length;
+  const totalMs = (totalChars / TYPEWRITER_CHARS_PER_SEC) * 1000;
+  const delayMs = tokens.length > 0 ? Math.max(8, totalMs / tokens.length) : 16;
+
+  function tick() {
+    if (cancelled) return;
+    if (i >= tokens.length) {
+      onDone();
+      return;
+    }
+    const partial = tokens.slice(0, i + 1).join("");
+    onProgress(partial);
+    i++;
+    setTimeout(tick, delayMs);
+  }
+
+  // Start after a tiny delay so the bubble appears first
+  const timer = setTimeout(tick, 50);
+  return () => {
+    cancelled = true;
+    clearTimeout(timer);
+  };
 }
 
 // ============================================================
@@ -63,13 +151,13 @@ function AgentAvatar({ name }: { name: string }) {
   );
 }
 
-function MessageBubble({
-  message,
-  agentName,
-}: {
-  message: Message;
-  agentName: string;
-}) {
+function StreamingCursor() {
+  return (
+    <span className="inline-block w-0.5 h-4 bg-gray-500 ml-0.5 animate-pulse align-middle" />
+  );
+}
+
+function MessageBubble({ message, agentName }: { message: Message; agentName: string }) {
   const isUser = message.role === "user";
 
   return (
@@ -87,10 +175,13 @@ function MessageBubble({
           }`}
         >
           {message.content}
+          {message.isStreaming && <StreamingCursor />}
         </div>
-        <span className="text-[11px] text-gray-400 px-1">
-          {formatTime(message.timestamp)}
-        </span>
+        {!message.isStreaming && (
+          <span className="text-[11px] text-gray-400 px-1">
+            {formatTime(message.timestamp)}
+          </span>
+        )}
       </div>
     </div>
   );
@@ -108,28 +199,27 @@ export function ChatWidget({
   businessPhone,
   businessLocation,
 }: Props) {
-  const [messages, setMessages] = useState<Message[]>([
-    {
-      id: generateId(),
-      role: "agent",
-      content: welcomeMessage,
-      timestamp: new Date(),
-    },
-  ]);
+  const initialMessage = useMemo<Message>(
+    () => ({ id: generateId(), role: "agent", content: welcomeMessage, timestamp: new Date() }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    []
+  );
+
+  const [messages, setMessages] = useState<Message[]>([initialMessage]);
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
+  const [isStreaming, setIsStreaming] = useState(false);
   const [conversationId, setConversationId] = useState<string | undefined>();
   const [error, setError] = useState<string | null>(null);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const cancelTypewriter = useRef<(() => void) | null>(null);
 
-  // Auto-scroll to bottom on new messages
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, isLoading]);
 
-  // Auto-resize textarea
   const handleInputChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     setInput(e.target.value);
     e.target.style.height = "auto";
@@ -152,57 +242,124 @@ export function ChatWidget({
     setError(null);
     setIsLoading(true);
 
-    // Reset textarea height
-    if (inputRef.current) {
-      inputRef.current.style.height = "auto";
-    }
+    if (inputRef.current) inputRef.current.style.height = "auto";
+
+    // Create placeholder agent message that will be filled as tokens arrive
+    const agentMsgId = generateId();
+    const agentMsgTimestamp = new Date();
 
     try {
       const res = await fetch("/api/agent/chat", {
-        method: "POST",
+        method:  "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+        body:    JSON.stringify({
           businessId,
-          message: text,
+          message:        text,
           conversationId,
-          channel: "WEBCHAT",
+          channel:        "WEBCHAT",
+          stream:         true,
         }),
       });
 
-      const json = await res.json();
-
-      if (!res.ok) {
-        throw new Error(json?.error?.message ?? "Something went wrong. Please try again.");
+      if (!res.ok || !res.body) {
+        const json = await res.json().catch(() => ({}));
+        throw new Error((json as { error?: { message?: string } })?.error?.message ?? "Something went wrong.");
       }
 
-      // Save conversationId for continuity
-      if (json.data?.conversationId) {
-        setConversationId(json.data.conversationId);
-      }
+      // Keep typing dots visible (isLoading=true) until the text chunk arrives.
+      // Read NDJSON stream: server sends one "chunk" event with the full AI
+      // text, then a "done" event. We animate the text with a local typewriter
+      // so the UX feels progressive even though the text arrived all at once.
+      let agentBubbleAdded = false;
 
-      const agentMsg: Message = {
-        id: generateId(),
-        role: "agent",
-        content: json.data?.response ?? "I'm sorry, I didn't get a response. Please try again.",
-        timestamp: new Date(),
-      };
-      setMessages((prev) => [...prev, agentMsg]);
+      for await (const event of readNDJSON(res.body)) {
+        if (event.type === "chunk" && typeof event.text === "string") {
+          const fullText = event.text;
+
+          // Add the agent bubble and hide typing dots at the same time
+          if (!agentBubbleAdded) {
+            agentBubbleAdded = true;
+            setMessages((prev) => [
+              ...prev,
+              { id: agentMsgId, role: "agent", content: "", timestamp: agentMsgTimestamp, isStreaming: true },
+            ]);
+            setIsLoading(false);
+            setIsStreaming(true);
+          }
+
+          // Cancel any in-progress animation
+          cancelTypewriter.current?.();
+
+          // Start typewriter animation
+          cancelTypewriter.current = animateTypewriter(
+            fullText,
+            (partial) => {
+              setMessages((prev) =>
+                prev.map((m) =>
+                  m.id === agentMsgId ? { ...m, content: partial, isStreaming: true } : m
+                )
+              );
+            },
+            () => {
+              setMessages((prev) =>
+                prev.map((m) =>
+                  m.id === agentMsgId
+                    ? { ...m, content: fullText, isStreaming: false }
+                    : m
+                )
+              );
+              setIsStreaming(false);
+            }
+          );
+        } else if (event.type === "done") {
+          if (typeof event.conversationId === "string") {
+            setConversationId(event.conversationId);
+          }
+        } else if (event.type === "error") {
+          const errMsg = typeof event.message === "string" ? event.message : "An error occurred.";
+          cancelTypewriter.current?.();
+          if (!agentBubbleAdded) {
+            agentBubbleAdded = true;
+            setMessages((prev) => [
+              ...prev,
+              { id: agentMsgId, role: "agent", content: errMsg, timestamp: agentMsgTimestamp, isStreaming: false, isError: true },
+            ]);
+            setIsLoading(false);
+          } else {
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === agentMsgId
+                  ? { ...m, content: errMsg, isStreaming: false, isError: true }
+                  : m
+              )
+            );
+          }
+          setError(errMsg);
+          setIsStreaming(false);
+        }
+      }
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : "Connection error. Please try again.";
       setError(errMsg);
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: generateId(),
-          role: "agent",
-          content: errMsg,
-          timestamp: new Date(),
-          isError: true,
-        },
-      ]);
+
+      // If we already added the placeholder, update it to an error bubble
+      setMessages((prev) => {
+        const hasPlaceholder = prev.some((m) => m.id === agentMsgId);
+        if (hasPlaceholder) {
+          return prev.map((m) =>
+            m.id === agentMsgId
+              ? { ...m, content: errMsg, isStreaming: false, isError: true }
+              : m
+          );
+        }
+        return [
+          ...prev,
+          { id: generateId(), role: "agent", content: errMsg, timestamp: new Date(), isError: true },
+        ];
+      });
     } finally {
       setIsLoading(false);
-      // Refocus input after response
+      setIsStreaming(false);
       setTimeout(() => inputRef.current?.focus(), 50);
     }
   }, [input, isLoading, businessId, conversationId]);
@@ -214,30 +371,25 @@ export function ChatWidget({
     }
   };
 
-  const canSend = input.trim().length > 0 && !isLoading;
+  const isBusy = isLoading || isStreaming;
+  const canSend = input.trim().length > 0 && !isBusy;
+  const showTypingDots = isLoading;
 
   return (
     <div className="flex flex-col h-full max-w-2xl mx-auto w-full">
-      {/* ── Header ─────────────────────────────────────────────── */}
+      {/* ── Header ──────────────────────────────────────────────── */}
       <header className="flex items-center gap-3 px-4 py-3 bg-white border-b border-gray-200 shadow-sm">
         <div className="flex-shrink-0 w-10 h-10 rounded-full bg-violet-600 text-white font-bold flex items-center justify-center">
           {agentName[0]?.toUpperCase()}
         </div>
         <div className="flex-1 min-w-0">
-          <h1 className="font-semibold text-gray-900 text-sm leading-tight truncate">
-            {agentName}
-          </h1>
+          <h1 className="font-semibold text-gray-900 text-sm leading-tight truncate">{agentName}</h1>
           <p className="text-xs text-gray-500 truncate">{businessName}</p>
         </div>
         <div className="text-right hidden sm:block">
-          {businessLocation && (
-            <p className="text-xs text-gray-400">{businessLocation}</p>
-          )}
+          {businessLocation && <p className="text-xs text-gray-400">{businessLocation}</p>}
           {businessPhone && (
-            <a
-              href={`tel:${businessPhone}`}
-              className="text-xs text-violet-600 hover:underline font-medium"
-            >
+            <a href={`tel:${businessPhone}`} className="text-xs text-violet-600 hover:underline font-medium">
               {businessPhone}
             </a>
           )}
@@ -248,16 +400,14 @@ export function ChatWidget({
       {/* ── Messages ───────────────────────────────────────────── */}
       <div className="flex-1 overflow-y-auto px-4 py-4 space-y-4 bg-gray-50">
         <div className="text-center py-2">
-          <span className="text-xs text-gray-400 bg-gray-100 px-3 py-1 rounded-full">
-            Today
-          </span>
+          <span className="text-xs text-gray-400 bg-gray-100 px-3 py-1 rounded-full">Today</span>
         </div>
 
         {messages.map((msg) => (
           <MessageBubble key={msg.id} message={msg} agentName={agentName} />
         ))}
 
-        {isLoading && (
+        {showTypingDots && (
           <div className="flex gap-2 items-end">
             <AgentAvatar name={agentName} />
             <div className="bg-white border border-gray-200 rounded-2xl rounded-bl-sm shadow-sm">
@@ -273,10 +423,7 @@ export function ChatWidget({
       {error && (
         <div className="px-4 py-2 bg-red-50 border-t border-red-100 flex items-center justify-between gap-2">
           <p className="text-xs text-red-600">{error}</p>
-          <button
-            onClick={() => setError(null)}
-            className="text-red-400 hover:text-red-600 text-xs flex-shrink-0"
-          >
+          <button onClick={() => setError(null)} className="text-red-400 hover:text-red-600 text-xs flex-shrink-0">
             Dismiss
           </button>
         </div>
@@ -290,9 +437,9 @@ export function ChatWidget({
             value={input}
             onChange={handleInputChange}
             onKeyDown={handleKeyDown}
-            placeholder="Type a message…"
+            placeholder={isBusy ? `${agentName} is typing…` : "Type a message…"}
             rows={1}
-            disabled={isLoading}
+            disabled={isBusy}
             className="flex-1 bg-transparent text-sm text-gray-800 placeholder-gray-400 resize-none outline-none py-1 max-h-28 disabled:opacity-50"
           />
           <button
@@ -312,16 +459,11 @@ export function ChatWidget({
   );
 }
 
-// ── Inline icons (no external dependency) ────────────────────────────────────
+// ── Inline icons (no external dependency) ─────────────────────────────────────
 
 function SendIcon() {
   return (
-    <svg
-      xmlns="http://www.w3.org/2000/svg"
-      viewBox="0 0 24 24"
-      fill="currentColor"
-      className="w-4 h-4 translate-x-0.5"
-    >
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-4 h-4 translate-x-0.5">
       <path d="M3.478 2.405a.75.75 0 00-.926.94l2.432 7.905H13.5a.75.75 0 010 1.5H4.984l-2.432 7.905a.75.75 0 00.926.94 60.519 60.519 0 0018.445-8.986.75.75 0 000-1.218A60.517 60.517 0 003.478 2.405z" />
     </svg>
   );

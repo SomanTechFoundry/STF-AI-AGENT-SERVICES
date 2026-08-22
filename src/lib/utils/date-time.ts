@@ -227,3 +227,88 @@ export function formatForDisplay(utcDate: Date, timezone: string): string {
   const { date, time } = utcToLocal(utcDate, timezone);
   return `${date} ${time}`;
 }
+
+// ============================================================
+// Relative date resolution — grounds the AI in "now" and lets it
+// (or a defensive fallback) convert "today"/"tomorrow"/"next friday"
+// into a real YYYY-MM-DD date in the business's timezone.
+// ============================================================
+
+const WEEKDAY_INDEX: Record<string, number> = {
+  sunday: 0, monday: 1, tuesday: 2, wednesday: 3,
+  thursday: 4, friday: 5, saturday: 6,
+};
+
+/**
+ * Build a grounding block for the system prompt: today's date, day name,
+ * current time, and a lookup table of the next N calendar days mapped to
+ * their date + weekday label. Giving the model a lookup table (rather than
+ * asking it to do date arithmetic from a single anchor) dramatically
+ * improves accuracy for relative date expressions like "next Friday".
+ */
+export function getRelativeDateReference(
+  timezone: string,
+  daysAhead = 14
+): { todayStr: string; todayLabel: string; currentTime: string; table: string } {
+  const now = new Date();
+  const { date: todayStr, time: currentTime } = utcToLocal(now, timezone);
+  const todayAnchor = new Date(`${todayStr}T00:00:00.000Z`);
+
+  const todayLabel = new Intl.DateTimeFormat("en-US", {
+    timeZone: "UTC",
+    weekday: "long",
+    month: "long",
+    day: "numeric",
+    year: "numeric",
+  }).format(todayAnchor);
+
+  const lines: string[] = [];
+  for (let i = 0; i < daysAhead; i++) {
+    const d = new Date(todayAnchor.getTime() + i * 86_400_000);
+    const dateStr = d.toISOString().slice(0, 10);
+    const dayName = new Intl.DateTimeFormat("en-US", { timeZone: "UTC", weekday: "long" }).format(d);
+    const monthDay = new Intl.DateTimeFormat("en-US", { timeZone: "UTC", month: "short", day: "numeric" }).format(d);
+    const label = i === 0 ? "TODAY" : i === 1 ? "TOMORROW" : dayName.toUpperCase();
+    lines.push(`${dateStr} = ${label} (${dayName}, ${monthDay})`);
+  }
+
+  return { todayStr, todayLabel, currentTime, table: lines.join("\n") };
+}
+
+/**
+ * Defensive fallback: resolves common relative date phrases into a
+ * YYYY-MM-DD string, anchored to "now" in the given timezone. Used inside
+ * tool executors in case the AI passes a relative phrase instead of an
+ * ISO date despite prompt instructions.
+ *
+ * Returns null if the input can't be confidently resolved.
+ */
+export function resolveRelativeDate(input: string, timezone: string): string | null {
+  const trimmed = input.trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) return trimmed;
+
+  const lower = trimmed.toLowerCase();
+  const { date: todayStr } = utcToLocal(new Date(), timezone);
+  const todayAnchor = new Date(`${todayStr}T00:00:00.000Z`);
+  const addDays = (days: number) => new Date(todayAnchor.getTime() + days * 86_400_000).toISOString().slice(0, 10);
+
+  if (lower === "today" || lower === "now") return addDays(0);
+  if (lower === "tomorrow") return addDays(1);
+  if (lower === "day after tomorrow") return addDays(2);
+  if (lower === "next week") return addDays(7);
+  if (lower === "this weekend") return addDays((6 - todayAnchor.getUTCDay() + 7) % 7 || 6); // upcoming Saturday
+
+  const weekdayMatch = lower.match(
+    /^(this\s+|next\s+|on\s+|the\s+)?(sunday|monday|tuesday|wednesday|thursday|friday|saturday)$/
+  );
+  if (weekdayMatch) {
+    const qualifier = (weekdayMatch[1] ?? "").trim();
+    const targetDow = WEEKDAY_INDEX[weekdayMatch[2] as string];
+    const todayDow = todayAnchor.getUTCDay();
+    let diff = (targetDow - todayDow + 7) % 7;
+    if (diff === 0 && qualifier === "next") diff = 7;
+    return addDays(diff);
+  }
+
+  return null;
+}
